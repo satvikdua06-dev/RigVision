@@ -22,7 +22,7 @@
 - 3 phone cameras stream via DroidCam RTSP
 - YOLOv8l detects persons + PPE (hard hat, vest, goggles) in one pass on RTX 4070
 - BoT-SORT tracks persons per-camera with persistent IDs + ReID embeddings
-- Cross-camera matching uses ReID appearance similarity + epipolar geometry
+- Cross-camera matching uses ArUco identity and epipolar geometry
 - DLT triangulation converts 2D pixel pairs → 3D room coordinates
 - Output: JSON array of tracked persons written to Redis at ~10Hz
 
@@ -51,7 +51,7 @@
 | 3D Rendering | Three.js, @react-three/fiber, @react-three/drei |
 | UI Framework | React 18, Zustand, Vite |
 | Backend API | FastAPI, Uvicorn |
-| CV Detection | YOLOv8l (Ultralytics), RTMPose-L |
+| CV Detection | YOLOv8l (Ultralytics) |
 | CV Tracking | BoT-SORT (via boxmot), IoU fallback |
 | Video Ingest | OpenCV, FFmpeg |
 | Sensor Transport | EMQX (MQTT) |
