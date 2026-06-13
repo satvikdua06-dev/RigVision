@@ -5,7 +5,7 @@
 **Name:** RigVision-3D
 **What it is:** A real-time 3D digital twin monitoring system for ONGC (Oil and Natural Gas Corporation) drilling rigs. It fuses a CAD-derived 3D model with live multi-camera video feeds and IoT sensor data into a single browser-based interactive dashboard.
 **Team:** 4 B.Tech students from LNMIIT, Jaipur (Communication and Computer Engineering dept), doing an 8-week summer internship at ONGC (May–July 2026).
-**Hardware:** 3 phone cameras (DroidCam RTSP), RTX 4070 GPU, procedural 3D model (2 rooms + corridor).
+**Hardware:** 4 phone cameras (DroidCam RTSP, 2 per room for stereo triangulation), RTX 4070 GPU, procedural 3D model (2 stacked rooms, no corridor).
 
 ---
 
@@ -13,17 +13,17 @@
 
 ### Pillar 1: 3D Digital Twin
 - Browser-based 3D rendering using Three.js + React (@react-three/fiber)
-- Procedural model: 2 rooms + 1 corridor (defined in `cad/zone_definitions.json`)
+- Procedural model: 2 stacked rooms — Room A (floor 0) and Room B (floor 1) directly above it, no corridor (defined in `cad/zone_definitions.json`)
 - Zones are translucent bounding boxes that change color: green=normal, amber=warning, red=critical
 - Equipment is clickable with metadata popups
 - Camera modes: OrbitControls (default), PointerLockControls (walkthrough), MapControls (top-down)
 
 ### Pillar 2: Multi-Camera CV Pipeline
-- 3 phone cameras stream via DroidCam RTSP
+- 4 phone cameras stream via DroidCam RTSP (2 per room, overlapping FOV)
 - YOLOv8l detects persons + PPE (hard hat, vest, goggles) in one pass on RTX 4070
 - BoT-SORT tracks persons per-camera with persistent IDs + ReID embeddings
-- Cross-camera matching uses ArUco identity and epipolar geometry
-- DLT triangulation converts 2D pixel pairs → 3D room coordinates
+- **Per-zone-group processing:** each room's 2 cameras are fused independently — cross-camera matching (ArUco identity + epipolar geometry) then DLT triangulation → 3D room coordinates. A person's zone is decided by *which camera group saw them*, so no global world frame is needed and rooms can't cross-contaminate.
+- **Single in-process pipeline** (`cv/pipeline.py`): detection → tracking → cross-camera → triangulation → sensor fusion all run in one process and write Redis directly. No Kafka in the CV path (the old `ccm-matches`/`3d-locations` topics and their services were removed as redundant).
 - Output: JSON array of tracked persons written to Redis at ~10Hz
 
 ### Pillar 3: Sensor Ingestion (the "seam")
@@ -37,12 +37,12 @@
 - The always-on YAML rule engine and `rigvision:violations:latest` were **removed**. Safety reporting is now on-demand LLM diagnostics (Pillar 5). PPE/occupancy violations will be re-added when PPE detection is integrated (`zone.ppe_violations` is already carried in the zone state, currently empty).
 
 ### Pillar 5: Knowledge Graph + On-Demand LLM Diagnostics
-- Neo4j graph (seeded by `knowledge/graph/seed_graph.py` from `cad/zone_definitions.json` + `knowledge/thresholds/threshold_registry.json`): Zone (`room_1`/`room_2`/`corridor`), Device (rig equipment: mud pump, control panel, compressor, wellhead), Sensor, Manual, ThresholdSpec, FailureMode, Symptom, Action nodes.
+- Neo4j graph (seeded by `knowledge/graph/seed_graph.py` from `cad/zone_definitions.json` + `knowledge/thresholds/threshold_registry.json`): Zone (`room_1`/`room_2`), Device (rig equipment: mud pump, control panel, compressor, wellhead), Sensor, Manual, ThresholdSpec, FailureMode, Symptom, Action nodes.
 - **Manual-derived thresholds:** limits come from device manuals, not hardcoded JSON. Offline: `knowledge/extraction/manual_threshold_extractor.py` (local LLM) extracts candidate ThresholdSpecs from `knowledge/documents/ONGC_Device_Manuals.txt` → human validates → `threshold_registry.json` → seeded into Neo4j. Runtime: `backend/services/threshold_resolver.py` resolves per-sensor limits with priority **device manual → zone environmental (HSE) → zone_definitions.json fallback** (also the safety net when Neo4j is down). Deterministic comparison in `backend/services/anomaly_evaluator.py` — the LLM never decides thresholds live. Inspect via `GET /api/thresholds`; re-resolve via `POST /api/thresholds/refresh` after re-seeding.
 - **Trigger:** "RUN DIAGNOSTICS" button in the Sensor Console → `POST /api/diagnostics/run`. Backend threshold-checks **every zone** against current sensor data (using resolved thresholds) and publishes **one Kafka alert per flagged zone** (`rigvision_alerts`), each carrying a `threshold_context` explaining which device/manual limit fired. No flags → instant `all_clear`, no LLM call.
 - **Pipeline:** `anomaly_listener` consumes each alert → KG Cypher query → ChromaDB vector search → LLM prompt → root-cause JSON. Each diagnostic is **self-describing** (carries its source `event_id`/`zone_id`/`severity`/telemetry/`threshold_context`) and lands in `rigvision:diagnostics` → AI Diagnostics modal.
 - **Anti-hallucination:** the LLM schema has `anomaly_detected`; the prompt forces "No issue detected" when `triggered_sensors` is empty / data is within limits.
-- **Models:** **Gemini** for embeddings only (`gemini-embedding-001`). **Answer generation runs locally** via LM Studio (OpenAI-compatible REST, called with `requests` — no `openai` SDK), configured by `LLM_BASE_URL`/`LLM_API_KEY`/`LLM_MODEL`. Zone→KG mapping: `zone_a→room_1`, `zone_b→room_2`, `corridor→corridor` (`_f1` variants reuse their base room).
+- **Models:** **Gemini** for embeddings only (`gemini-embedding-001`). **Answer generation runs locally** via LM Studio (OpenAI-compatible REST, called with `requests` — no `openai` SDK), configured by `LLM_BASE_URL`/`LLM_API_KEY`/`LLM_MODEL`. Zone→KG mapping: `zone_a→room_1`, `zone_b→room_2`.
 
 ---
 
@@ -109,16 +109,24 @@ Flow: Sensor Console sliders → SEND TO REDIS → RUN DIAGNOSTICS → per-zone 
 
 ## ZONE LAYOUT
 
+Two stacked rooms (no corridor). Room B sits directly above Room A. Each room is an
+8×6m bay, 3.4m tall; each is covered by 2 overlapping cameras.
+
 ```
-   ┌────────────┐        ┌────────────┐
-   │   ROOM A   │──│CORR│──│   ROOM B   │
-   │  (zone_a)  │  │IDOR│  │  (zone_b)  │
-   │   4×5m     │  │2×2m│  │   4×5m     │
-   └────────────┘  └────┘  └────────────┘
-   X: 0────4      4──6     6────10
+   ┌────────────┐
+   │   ROOM B   │   floor 1  (zone_b)  cam2 + cam3   Y: 3.4──6.8
+   │  (zone_b)  │
+   ├────────────┤
+   │   ROOM A   │   floor 0  (zone_a)  cam0 + cam1   Y: 0────3.4
+   │  (zone_a)  │
+   └────────────┘
+   X: 0────8   Z: 0────6
 ```
 
-Total: 10m × 5m × 3m. Origin at corner of Room A. Y = up.
+Total: 8m (X) × 6m (Z) × 6.8m (Y, two 3.4m floors). Origin at the ground-floor corner of
+Room A. Y = up. Camera groups: `zone_a → [cam0, cam1]`, `zone_b → [cam2, cam3]`. The 3D
+model is hand-built (procedural) in `frontend/src/components/Scene3D.jsx` — no external
+GLTF asset.
 
 ---
 
