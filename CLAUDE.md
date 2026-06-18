@@ -42,7 +42,9 @@
 - **Trigger:** "RUN DIAGNOSTICS" button in the Sensor Console → `POST /api/diagnostics/run`. Backend threshold-checks **every zone** against current sensor data (using resolved thresholds) and publishes **one Kafka alert per flagged zone** (`rigvision_alerts`), each carrying a `threshold_context` explaining which device/manual limit fired. No flags → instant `all_clear`, no LLM call.
 - **Pipeline:** `anomaly_listener` consumes each alert → KG Cypher query → ChromaDB vector search → LLM prompt → root-cause JSON. Each diagnostic is **self-describing** (carries its source `event_id`/`zone_id`/`severity`/telemetry/`threshold_context`) and lands in `rigvision:diagnostics` → AI Diagnostics modal.
 - **Anti-hallucination:** the LLM schema has `anomaly_detected`; the prompt forces "No issue detected" when `triggered_sensors` is empty / data is within limits.
-- **Models:** **Gemini** for embeddings only (`gemini-embedding-001`). **Answer generation runs locally** via LM Studio (OpenAI-compatible REST, called with `requests` — no `openai` SDK), configured by `LLM_BASE_URL`/`LLM_API_KEY`/`LLM_MODEL`. Zone→KG mapping: `zone_a→room_1`, `zone_b→room_2`.
+- **Models:** **Both embeddings and generation run locally** via LM Studio (OpenAI-compatible REST, called with `requests` — no `openai`/`google` SDK). Generation is configured by `LLM_BASE_URL`/`LLM_API_KEY`/`LLM_MODEL`; embeddings by `EMBED_BASE_URL`/`EMBED_API_KEY`/`EMBED_MODEL` (shared helper `knowledge/agent_layer/embeddings.py`). Changing `EMBED_MODEL` requires re-running `rag_ingestion.py` (ChromaDB stores one vector dimensionality). Zone→KG mapping: `zone_a→room_1`, `zone_b→room_2`.
+- **Thresholds are bidirectional:** sensors may carry `warning_low`/`critical_low` in addition to `warning`/`critical` (e.g. pressure — loss of pressure is as dangerous as overpressure). `anomaly_evaluator` reports a `breach_direction` (`high`/`low`) in `threshold_context`; a low breach maps to the `<type>_low` KG symptom (e.g. `pressure_low`) so it resolves to the loss-of-pressure failure modes.
+- **API auth:** set `RIGVISION_API_KEY` (+ `VITE_API_KEY` in the frontend) to require `X-API-Key` on mutating endpoints; `RUN DIAGNOSTICS` is rate-limited by `DIAGNOSTICS_MIN_INTERVAL`. Empty key = auth off (dev).
 
 ---
 
@@ -62,7 +64,7 @@
 | Cache | Redis 7 |
 | Knowledge Graph | Neo4j 5.x |
 | Vector Store | ChromaDB |
-| LLM (embeddings) | Gemini (`gemini-embedding-001`) |
+| LLM (embeddings) | Local via LM Studio (OpenAI-compatible `/v1/embeddings`) |
 | LLM (generation) | Local via LM Studio (OpenAI-compatible REST), e.g. Qwen2.5-7B / Gemma |
 
 ---
